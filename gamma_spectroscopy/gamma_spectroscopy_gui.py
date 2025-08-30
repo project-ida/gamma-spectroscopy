@@ -15,6 +15,7 @@ import pyqtgraph as pg
 from gamma_spectroscopy.picoscope_5000a import PicoScope5000A, INPUT_RANGES
 from gamma_spectroscopy.fake_picoscope import FakePicoScope
 
+from gamma_spectroscopy.settings_persistence import attach_settings_store
 
 GUIDE_COLORS = {
     'red': (255, 0, 0, 63),
@@ -107,6 +108,9 @@ class UserInterface(QtWidgets.QMainWindow):
             self.scope = PicoScope5000A()
 
         self.init_ui()
+        
+        # Persisted settings (loads after the UI shows)
+        self._settings_store = attach_settings_store(self, org="YourLab", app="GammaSpectroscopy")
 
     def closeEvent(self, event):
         self._is_running = False
