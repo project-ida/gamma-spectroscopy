@@ -15,6 +15,7 @@ import pyqtgraph as pg
 from gamma_spectroscopy.picoscope_5000a import PicoScope5000A, INPUT_RANGES
 from gamma_spectroscopy.fake_picoscope import FakePicoScope
 
+from gamma_spectroscopy.root_exporter import RootWriter, next_run_id
 from gamma_spectroscopy.settings_persistence import attach_settings_store
 
 GUIDE_COLORS = {
@@ -96,7 +97,8 @@ class UserInterface(QtWidgets.QMainWindow):
     _output_filename = None
     _output_file = None
 
-    def __init__(self, use_fake=False):
+    def __init__(self, use_fake=False, root_export_folder=None, root_max_mb=None):
+
         super().__init__()
 
         self._pulseheights = {'A': [], 'B': []}
@@ -112,9 +114,31 @@ class UserInterface(QtWidgets.QMainWindow):
         # Persisted settings (loads after the UI shows)
         self._settings_store = attach_settings_store(self, org="YourLab", app="GammaSpectroscopy")
 
+        # Root writers (open once after settings have loaded, so channel checkboxes are correct)
+        self._root_folder = root_export_folder
+        self._root_max_mb = root_max_mb
+        self._writers = {}
+
+        if self._root_folder:
+        
+            self.label_status.setText(f"ROOT export → {self._root_folder}")      
+        
+            def _open_writers():
+                rid = next_run_id(self._root_folder)
+                if self.ch_A_enabled_box.isChecked():
+                    self._writers[0] = RootWriter(self._root_folder, "A", rid, self._root_max_mb)
+                if self.ch_B_enabled_box.isChecked():
+                    self._writers[1] = RootWriter(self._root_folder, "B", rid, self._root_max_mb)
+            QtCore.QTimer.singleShot(0, _open_writers)
+
     def closeEvent(self, event):
         self._is_running = False
         self.scope.stop()
+        for w in self._writers.values():
+            try:
+                w.close()
+            except:
+                pass
 
     def init_ui(self):
         pg.setConfigOption('background', 'k')
@@ -244,7 +268,8 @@ class UserInterface(QtWidgets.QMainWindow):
         self._run_time = time.time() - self._t_start_run
         self._t_prev_run_time += self._run_time
         self.run_stop_button.setText("Run")
-        self.single_button.setDisabled(False)
+        self.single_button.setDisabled(False)     
+        
         if self._write_output:
             self.write_info_file()
             self.close_output_file()
@@ -468,6 +493,26 @@ class UserInterface(QtWidgets.QMainWindow):
                 B = B.compress(condition, axis=0)
                 baselines = baselines.compress(condition, axis=1)
                 pulseheights = pulseheights.compress(condition, axis=1)
+
+        # ROOT export (open once at startup; Run/Stop only gates whether we *get* data)
+        if self._writers:
+            tsA = x[np.argmax(A, axis=1)] if A.size else np.array([])
+            tsB = x[np.argmax(B, axis=1)] if B.size else np.array([])
+            fs = self._range
+            if fs:
+                scale = 32767.0 / fs
+                def emit(arr, ph, ts, ch_idx):
+                    w = self._writers.get(ch_idx)
+                    if w is None or arr is None or arr.size == 0: return
+                    arr = arr / self._polarity_sign  # store raw polarity
+                    n = min(arr.shape[0], len(ph), len(ts))
+                    samples = np.clip(np.rint(arr[:n] * scale), -32768, 32767).astype(np.int16)
+                    t_ns = (np.asarray(ts[:n]) * 1e9).astype(np.uint64)
+                    e_u16 = np.clip(np.rint(ph[:n]), 0, 65535).astype(np.uint16)
+                    for i in range(n):
+                        w.add(samples_i16=samples[i], ts_ns=int(t_ns[i]), energy_u16=int(e_u16[i]))
+                emit(A, pulseheights[0], tsA, 0)
+                emit(B, pulseheights[1], tsB, 1)
 
         for channel, tvalues, blvalues, phvalues \
             in zip(['A', 'B'], times, baselines, pulseheights):
@@ -705,12 +750,23 @@ def main():
     global qtapp
 
     parser = argparse.ArgumentParser()
+    
+    parser.add_argument("--root-export-folder", type=str, default=None,
+                        help="Folder to write ROOT files (one per active channel).")
+    parser.add_argument("--root-max-mb", type=int, default=None,
+                        help="Split ROOT when file size (MB) is reached.")
+
     parser.add_argument('--fake', action='store_true',
                         help="Use fake hardware")
     args = parser.parse_args()
 
     qtapp = QtWidgets.QApplication(sys.argv)
-    ui = UserInterface(use_fake=args.fake)
+
+    ui = UserInterface(
+        use_fake=args.fake,
+        root_export_folder=args.root_export_folder,
+        root_max_mb=args.root_max_mb,
+    )    
     sys.exit(qtapp.exec_())
 
 
