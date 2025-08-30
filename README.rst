@@ -4,6 +4,8 @@ A GUI for gamma spectroscopy using a PicoScope
 Introduction
 ------------
 
+Fork of davidfokkema/gamma-spectroscopy. Changes by Project IDA include uproot ROOT export and settings persistence.
+
 This is a data acquisition app for gamma spectroscopy. The Qt app requires a 5000-series PicoScope (e.g. the 5242D) for data acquisition.
 
 Gamma spectroscopy of nuclear sources is commonly performed using either custom hardware (somewhat cheaper, easier to use, but less versatile) or modular hardware like NIM-crates (more expensive, harder to use, but more versatile). For the undergraduate physics lab at the Vrije Universiteit Amsterdam and the University of Amsterdam we require the versatility of modular hardware, but would like the ease-of-use of custom solutions. This way, students can focus on their research instead of working through a bunch of manuals.
@@ -31,6 +33,8 @@ Prerequisites
 * NumPy
 * PyQt5
 * PyQtGraph
+* Uproot
+* Awkward
 
 To install the PicoSDK C libraries, follow the instructions at https://github.com/picotech/picosdk-python-wrappers.
 
