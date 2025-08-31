@@ -10,6 +10,8 @@ PicoScope5000A
 import ctypes
 from threading import Event
 
+import time
+
 import numpy as np
 
 from picosdk.ps5000a import ps5000a as ps
@@ -96,6 +98,10 @@ class PicoScope5000A:
         self._buffers = {}
         self.data_is_ready = Event()
         self._callback = callback_factory(self.data_is_ready)
+
+        # cache for last trigger offsets (ns) fetched after a run
+        self._last_trigger_offsets_ns = None
+
         self.open(serial, resolution_bits)
 
     def __del__(self):
@@ -251,7 +257,21 @@ class PicoScope5000A:
             else:
                 V_data.append(None)
 
+        # Determine number of segments and cache trigger offsets (ns)
+        n_segments = 0
+        for arr in V_data:
+            if arr is not None:
+                n_segments = arr.shape[0]
+                break
+        self._last_trigger_offsets_ns = (
+            self._get_trigger_offsets_ns(0, n_segments) if n_segments else None
+        )
+
         return time_values, V_data
+
+    def get_last_trigger_offsets_ns(self):
+        """Return the last per-segment trigger offsets (ns) or None."""
+        return self._last_trigger_offsets_ns
 
     def _calculate_time_values(self, timebase, num_samples):
         """Calculate time values from timebase and number of samples."""
@@ -391,6 +411,69 @@ class PicoScope5000A:
             return None
         else:
             raise PicoSDKError(f"PicoSDK returned {status_msg}")
+
+    def _get_trigger_offsets_ns(self, first_segment: int, n_segments: int):
+
+        if n_segments <= 0:
+            return None
+
+        # map time-units enum -> scale (to nanoseconds)
+        def _units_to_ns_scale(enum_val: int) -> float:
+            return {0: 1e-6, 1: 1e-3, 2: 1.0, 3: 1e3, 4: 1e6, 5: 1e9}.get(int(enum_val), 1.0)
+
+        to_idx = int(first_segment) + int(n_segments) - 1  # inclusive
+
+        # Try the 64-bit API first
+        try:
+            fn = ps.ps5000aGetValuesTriggerTimeOffsetBulk64
+            # int16 handle, int64* times, int32* units, uint32 from, uint32 to
+            fn.argtypes = [
+                ctypes.c_int16,
+                ctypes.POINTER(ctypes.c_int64),
+                ctypes.POINTER(ctypes.c_int32),
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+            ]
+            fn.restype = ctypes.c_int32
+
+            times = (ctypes.c_int64 * n_segments)()
+            units = ctypes.c_int32(0)
+            assert_pico_ok(fn(self._handle, times, ctypes.byref(units),
+                              ctypes.c_uint32(first_segment), ctypes.c_uint32(to_idx)))
+            scale = _units_to_ns_scale(units.value)
+            arr = np.frombuffer(times, dtype=np.int64, count=n_segments).astype(np.float64)
+            return (arr * scale).astype(np.int64)
+
+        except AttributeError:
+            # Fall back to legacy split-upper/lower API
+            try:
+                fn = ps.ps5000aGetValuesTriggerTimeOffsetBulk
+                # int16 handle, int16* upper, uint32* lower, int32* units, uint32 from, uint32 to
+                fn.argtypes = [
+                    ctypes.c_int16,
+                    ctypes.POINTER(ctypes.c_int16),
+                    ctypes.POINTER(ctypes.c_uint32),
+                    ctypes.POINTER(ctypes.c_int32),
+                    ctypes.c_uint32,
+                    ctypes.c_uint32,
+                ]
+                fn.restype = ctypes.c_int32
+
+                up = (ctypes.c_int16 * n_segments)()
+                lo = (ctypes.c_uint32 * n_segments)()
+                units = ctypes.c_int32(2)  # default ns
+                assert_pico_ok(fn(self._handle, up, lo, ctypes.byref(units),
+                                  ctypes.c_uint32(first_segment), ctypes.c_uint32(to_idx)))
+                scale = _units_to_ns_scale(units.value)
+                up64 = np.frombuffer(up, dtype=np.int16, count=n_segments).astype(np.int64)
+                lo64 = np.frombuffer(lo, dtype=np.uint32, count=n_segments).astype(np.int64)
+                arr = (up64 << 32) | lo64  # signed high + unsigned low
+                return (arr.astype(np.float64) * scale).astype(np.int64)
+            except Exception:
+                return None
+
+        except Exception:
+            return None
 
     def stop(self):
         """Stop data capture."""

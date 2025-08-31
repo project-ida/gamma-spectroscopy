@@ -119,6 +119,9 @@ class UserInterface(QtWidgets.QMainWindow):
         self._root_max_mb = root_max_mb
         self._writers = {}
 
+        # Absolute time epoch (ns) for this run; set when Run starts
+        self._run_epoch_ns = 0
+
         if self._root_folder:
         
             self.label_status.setText(f"ROOT export → {self._root_folder}")      
@@ -247,6 +250,10 @@ class UserInterface(QtWidgets.QMainWindow):
         if not self.is_run_time_completed():
             self._is_running = True
             self._t_start_run = time.time()
+
+            # Absolute epoch for per-event timestamps (ns)
+            self._run_epoch_ns = time.time_ns()
+
             self._run_time = 0
             self._update_run_time_label()
             self.run_timer.start()
@@ -433,9 +440,13 @@ class UserInterface(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def fetch_data(self):
         t, [A, B] = self.scope.get_data()
+        
+        # retrieve cached per-capture trigger offsets from the scope
+        trig_offsets_ns = self.scope.get_last_trigger_offsets_ns()
+
         if A is not None:
             self.num_events += len(A)
-            self.plot_data_signal.emit({'x': t, 'A': A, 'B': B})
+            self.plot_data_signal.emit({'x': t, 'A': A, 'B': B, 'trig_offsets_ns': trig_offsets_ns})
         if self._is_running:
             if self.is_run_time_completed():
                 self.stop_run()
@@ -461,6 +472,7 @@ class UserInterface(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(dict)
     def plot_data(self, data):
         x, A, B = data['x'], data['A'], data['B']
+        trig_offsets_ns = data.get('trig_offsets_ns', None)
         times, baselines, pulseheights = [], [], []
         for data in A, B:
             data *= self._polarity_sign
@@ -501,18 +513,47 @@ class UserInterface(QtWidgets.QMainWindow):
             fs = self._range
             if fs:
                 scale = 32767.0 / fs
-                def emit(arr, ph, ts, ch_idx):
+                # dt from timebase is in nanoseconds in this codebase
+                dt_ns = self.scope.get_interval_from_timebase(self._timebase)
+                pre_ns = int(self._pre_samples * dt_ns)
+
+                def emit(arr, ph, ts_peak_sec, ch_idx, trig_ns):
+                    """
+                    arr:   (n, num_samples) waveforms (V)
+                    ph:    (n,) pulse heights (mV)
+                    ts_peak_sec: (n,) peak times inside the capture (seconds, from x)
+                    trig_ns: (n,) absolute trigger times for each capture in ns
+                              or None -> fallback to run epoch only
+                    """
                     w = self._writers.get(ch_idx)
-                    if w is None or arr is None or arr.size == 0: return
-                    arr = arr / self._polarity_sign  # store raw polarity
-                    n = min(arr.shape[0], len(ph), len(ts))
+                    if w is None or arr is None or arr.size == 0:
+                        return
+
+                    # store raw (un-flipped) waveform
+                    arr = arr / self._polarity_sign
+                    n = min(arr.shape[0], len(ph), len(ts_peak_sec))
+                    if n <= 0:
+                        return
+
                     samples = np.clip(np.rint(arr[:n] * scale), -32768, 32767).astype(np.int16)
-                    t_ns = (np.asarray(ts[:n]) * 1e9).astype(np.uint64)
+                    # peak offset relative to trigger in ns
+                    dpk_ns = (np.asarray(ts_peak_sec[:n]) * 1e9 - pre_ns).astype(np.int64)
+
+                    # STRICT: require driver-provided trigger offsets
+                    base_ns = np.asarray(trig_ns[:n], dtype=np.int64) + np.int64(self._run_epoch_ns) # comment out the last part for relative timestamps
+                    t_ns = base_ns + dpk_ns
+
+                    # avoid negative (can happen transiently if a peak falls before the trigger)
+                    t_ns = np.maximum(t_ns, 0).astype(np.uint64)
+
                     e_u16 = np.clip(np.rint(ph[:n]), 0, 65535).astype(np.uint16)
                     for i in range(n):
                         w.add(samples_i16=samples[i], ts_ns=int(t_ns[i]), energy_u16=int(e_u16[i]))
-                emit(A, pulseheights[0], tsA, 0)
-                emit(B, pulseheights[1], tsB, 1)
+
+                # Use the scope-provided trigger offsets for A/B (same offsets for both channels)
+                emit(A, pulseheights[0], tsA, 0, trig_offsets_ns)
+                emit(B, pulseheights[1], tsB, 1, trig_offsets_ns)
+
 
         for channel, tvalues, blvalues, phvalues \
             in zip(['A', 'B'], times, baselines, pulseheights):
