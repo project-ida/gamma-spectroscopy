@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import awkward as ak
 import uproot
+import threading, queue  # ← async writer
 
 # Match: DataR_CHA@Picoscope_run00007_3.root (A/B, 5 digits, part int)
 _RE = re.compile(r"^DataR_CH[AB]@Picoscope_run(\d{5})_(\d+)\.root$")
@@ -65,6 +66,11 @@ class RootWriter:
         self._tree = None
         self.path: Path | None = None  # current on-disk path (tmp while writing)
         self._open()
+
+        # --- async writer thread: the file handle is only used by this thread ---
+        self._q = queue.Queue(maxsize=16)  # holds ("WRITE", payload) or ("FINALIZE", None)
+        self._writer = threading.Thread(target=self._writer_loop, name=f"RootWriter-{self.ch}", daemon=True)
+        self._writer.start()
 
     def add(self, samples_i16: np.ndarray, ts_ns: int, energy_u16: int,
             flags_u32: int = 0, probe_i32: int | None = None, board_u16: int = 0):
@@ -128,21 +134,21 @@ class RootWriter:
             "Probe":     np.asarray(self._buf["Probe"],     dtype=np.int32),
             "Samples":   ak.Array(self._buf["Samples"]),  # jagged int16
         }
-        if self._tree is None:
-            self._f["Data_R"] = payload
-            self._tree = self._f["Data_R"]
-        else:
-            self._tree.extend(payload)
+        # Hand off the disk write to the background thread
+        self._q.put(("WRITE", payload))
         for v in self._buf.values(): v.clear()
-        self._roll()
 
     def close(self):
-        """Flush and finalize current .tmp -> .root (if any)."""
+        """Flush outstanding buffers, finalize .tmp → .root, and stop the worker."""
         try:
-            self.flush()
-        finally:
-            # finalize: ensure file is closed and rename .tmp -> .root
-            self._finalize_file()
+            if self._buf["Channel"]:
+                self.flush()  # enqueues last payload
+            self._q.put(("FINALIZE", None))
+            self._q.join()  # wait until writer processed everything
+            if self._writer.is_alive():
+                self._writer.join(timeout=2.0)
+        except Exception:
+            pass
 
     # ---- internals ----
     def _fname_final(self) -> Path:  # DataR_CH{A|B}@Picoscope_run{NNNNN}_{part}.root
@@ -178,6 +184,25 @@ class RootWriter:
             except Exception:
                 # non-fatal: if rename fails, we leave the .tmp in place
                 pass
+
+    def _writer_loop(self):
+        """Owns all I/O to the ROOT file: writes, rolling, and finalization."""
+        while True:
+            cmd, payload = self._q.get()
+            try:
+                if cmd == "WRITE":
+                    if self._tree is None:
+                        self._f["Data_R"] = payload
+                        self._tree = self._f["Data_R"]
+                    else:
+                        self._tree.extend(payload)
+                    # rolling is done on the writer thread
+                    self._roll()
+                elif cmd == "FINALIZE":
+                    self._finalize_file()
+                    return
+            finally:
+                self._q.task_done()
 
     def _roll(self):
         """If size threshold reached, finalize current .tmp and open next .tmp part."""
