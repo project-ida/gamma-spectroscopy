@@ -61,6 +61,9 @@ class RootWriter:
         self.flush_every = int(flush_every)
         self._compression = compression
         self._buf = {k: [] for k in ("Channel","Timestamp","Board","Energy","Flags","Probe","Samples")}
+        self._f = None
+        self._tree = None
+        self.path: Path | None = None  # current on-disk path (tmp while writing)
         self._open()
 
     def add(self, samples_i16: np.ndarray, ts_ns: int, energy_u16: int,
@@ -134,25 +137,58 @@ class RootWriter:
         self._roll()
 
     def close(self):
-        self.flush()
-        try: self._f.close()
-        except: pass
+        """Flush and finalize current .tmp -> .root (if any)."""
+        try:
+            self.flush()
+        finally:
+            # finalize: ensure file is closed and rename .tmp -> .root
+            self._finalize_file()
 
     # ---- internals ----
-    def _fname(self):  # DataR_CH{A|B}@Picoscope_run{NNNNN}_{part}.root
+    def _fname_final(self) -> Path:  # DataR_CH{A|B}@Picoscope_run{NNNNN}_{part}.root
         return self.dir / f"DataR_CH{self.ch}@Picoscope_run{self.run_id:05d}_{self.part}.root"
 
+    def _fname_tmp(self) -> Path:    # temp while writing, visible as .tmp
+        return self.dir / f"DataR_CH{self.ch}@Picoscope_run{self.run_id:05d}_{self.part}.tmp"
+
     def _open(self):
-        self.path = self._fname()
+        """Open a new .tmp file for the current part."""
+        self.path = self._fname_tmp()
         self._f = uproot.recreate(str(self.path), compression=self._compression)
         self._tree = None
 
+    def _finalize_file(self):
+        """Close the current file (if open) and rename .tmp -> .root."""
+        try:
+            if self._f is not None:
+                try:
+                    self._f.close()
+                finally:
+                    self._f = None
+                    self._tree = None
+        finally:
+            try:
+                if self.path is not None:
+                    p = Path(self.path)
+                    if p.suffix == ".tmp" and p.exists():
+                        final = self._fname_final()
+                        # replace() will overwrite if a stale .root exists
+                        p.replace(final)
+                        self.path = final
+            except Exception:
+                # non-fatal: if rename fails, we leave the .tmp in place
+                pass
+
     def _roll(self):
-        if not self.max_bytes: return
-        try: size = os.path.getsize(self.path)
-        except FileNotFoundError: return
-        if size >= self.max_bytes:
-            try: self._f.close()
-            except: pass
+        """If size threshold reached, finalize current .tmp and open next .tmp part."""
+        if not self.max_bytes:
+            return
+        try:
+            sz = os.path.getsize(self.path) if self.path else 0
+        except FileNotFoundError:
+            return
+        if sz >= self.max_bytes:
+            # finalize current file -> .root, then open next .tmp
+            self._finalize_file()
             self.part += 1
             self._open()
