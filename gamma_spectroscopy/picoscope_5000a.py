@@ -97,7 +97,14 @@ class PicoScope5000A:
         self._input_adc_ranges = {}
         self._buffers = {}
         self.data_is_ready = Event()
-        self._callback = callback_factory(self.data_is_ready)
+
+        self._last_ready_mono_ns = None
+
+        @ctypes.CFUNCTYPE(None, ctypes.c_int16, ctypes.c_int, ctypes.c_void_p)
+        def _cb(handle, status, parameters):
+            self._last_ready_mono_ns = time.monotonic_ns()
+            self.data_is_ready.set()
+        self._callback = _cb
 
         # cache for last trigger offsets (ns) fetched after a run
         self._last_trigger_offsets_ns = None
@@ -109,6 +116,9 @@ class PicoScope5000A:
         if self._handle:
             self.stop()
             self.close()
+   
+    def get_last_block_ready_mono_ns(self):
+        return self._last_ready_mono_ns
 
     def open(self, serial=None, resolution_bits=12):
         """Open the device.
