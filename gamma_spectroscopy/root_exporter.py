@@ -10,18 +10,31 @@ import uproot
 _RE = re.compile(r"^DataR_CH[AB]@Picoscope_run(\d{5})_(\d+)\.root$")
 
 def next_run_id(folder: str | os.PathLike) -> int:
-    p = Path(folder); p.mkdir(parents=True, exist_ok=True)
+    p = Path(folder)
+    p.mkdir(parents=True, exist_ok=True)
+
     mx = -1
+
+    # New layout: per-run subfolders named "runNNNNN"
+    for d in p.iterdir():
+        if d.is_dir():
+            name = d.name
+            if name.startswith("run") and len(name) == 8 and name[3:].isdigit():
+                mx = max(mx, int(name[3:]))
+
+    # Legacy layout: files directly in <folder>
     for f in p.glob("DataR_CH*@Picoscope_run?????_*.root"):
         m = _RE.match(f.name)
-        if m: mx = max(mx, int(m.group(1)))
+        if m:
+            mx = max(mx, int(m.group(1)))
+
     return mx + 1  # 0 if none
 
 class RootWriter:
     """One ROOT file per channel; rolls parts when size >= max_mb."""
     def __init__(self, folder: str, ch_label: str, run_id: int, max_mb: int | None):
         assert ch_label in ("A", "B")
-        self.dir = Path(folder); self.dir.mkdir(parents=True, exist_ok=True)
+        self.dir = Path(folder) 
         self.ch = ch_label
         self.ch_idx = 0 if ch_label == "A" else 1
         self.run_id = int(run_id)

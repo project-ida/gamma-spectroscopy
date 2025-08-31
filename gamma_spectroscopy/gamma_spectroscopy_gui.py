@@ -5,6 +5,7 @@ from math import floor
 import sys
 from pathlib import Path
 import time
+from datetime import datetime
 
 import numpy as np
 from pkg_resources import resource_filename
@@ -134,10 +135,19 @@ class UserInterface(QtWidgets.QMainWindow):
         
             def _open_writers():
                 rid = next_run_id(self._root_folder)
+                run_raw_dir = Path(self._root_folder) / f"run{rid:05d}" / "RAW"
+                run_raw_dir.mkdir(parents=True, exist_ok=True)
+
+                # Save run-level info for settings.txt
+                self._run_id = rid
+                self._run_dir = run_raw_dir.parent  # path to .../runNNNNN
+                self._settings_written = False
+
                 if self.ch_A_enabled_box.isChecked():
-                    self._writers[0] = RootWriter(self._root_folder, "A", rid, self._root_max_mb)
+                    self._writers[0] = RootWriter(run_raw_dir, "A", rid, self._root_max_mb)
                 if self.ch_B_enabled_box.isChecked():
-                    self._writers[1] = RootWriter(self._root_folder, "B", rid, self._root_max_mb)
+                    self._writers[1] = RootWriter(run_raw_dir, "B", rid, self._root_max_mb)
+
             QtCore.QTimer.singleShot(0, _open_writers)
 
     def closeEvent(self, event):
@@ -234,6 +244,34 @@ class UserInterface(QtWidgets.QMainWindow):
 
         self.run_timer.timeout.connect(self._update_run_time_label)
 
+        # --- settings snapshot on changes (debounced) ---
+        self._info_snapshot_timer = QtCore.QTimer(self)
+        self._info_snapshot_timer.setSingleShot(True)
+        self._info_snapshot_timer.setInterval(1000)  # 1 s debounce
+        self._info_snapshot_timer.timeout.connect(self._snapshot_info)
+
+        def _hook(w, sig):
+            getattr(w, sig).connect(self._snapshot_info_throttled)
+
+        for w, sig in [
+            (self.range_box, 'currentIndexChanged'),
+            (self.offset_box, 'valueChanged'),
+            (self.threshold_box, 'valueChanged'),
+            (self.upper_threshold_box, 'valueChanged'),
+            (self.trigger_box, 'stateChanged'),
+            (self.upper_trigger_box, 'stateChanged'),
+            (self.trigger_channel_box, 'currentTextChanged'),
+            (self.timebase_box, 'valueChanged'),
+            (self.pre_trigger_box, 'valueChanged'),
+            (self.post_trigger_box, 'valueChanged'),
+            (self.baseline_correction_box, 'stateChanged'),
+            (self.polarity_box, 'currentIndexChanged'),
+            (self.coupling_box, 'currentIndexChanged'),
+            (self.ch_A_enabled_box, 'stateChanged'),
+            (self.ch_B_enabled_box, 'stateChanged'),
+        ]:
+            _hook(w, sig)
+
         self.init_event_plot()
         self.init_spectrum_plot()
 
@@ -247,6 +285,20 @@ class UserInterface(QtWidgets.QMainWindow):
 
     def _emit_value_changed_signal(self, widget):
         widget.valueChanged.emit(widget.value())
+
+    def _snapshot_info_throttled(self):
+        """Debounce settings snapshots so sliders don't spam files."""
+        if not self._is_running or not getattr(self, "_run_dir", None):
+            return
+        self._info_snapshot_timer.stop()
+        self._info_snapshot_timer.start()
+
+    def _snapshot_info(self):
+        """Write a settings/info snapshot into the current run folder."""
+        if not self._is_running or not getattr(self, "_run_dir", None):
+            return
+        ts = time.strftime("%Y-%m-%d_%H-%M-%S")  # human-readable, filename-safe
+        self.write_info_file(info_filename=Path(self._run_dir) / f"info{ts}.txt")
 
     @QtCore.pyqtSlot()
     def toggle_run_stop(self):
@@ -263,7 +315,10 @@ class UserInterface(QtWidgets.QMainWindow):
             # Absolute epoch for per-event timestamps (ns)
             self._run_epoch_wall_ns = time.time_ns()
             self._run_epoch_mono_ns = time.monotonic_ns()
-            # (Optionally write self._run_epoch_wall_ns to a small text file here)
+
+            # Create settings.txt once per run folder
+            self._maybe_write_run_settings()
+            self.write_info_file(info_filename=Path(self._run_dir) / "info.txt")
 
             self._run_time = 0
             self._update_run_time_label()
@@ -277,6 +332,24 @@ class UserInterface(QtWidgets.QMainWindow):
                 writer = csv.writer(self._output_file)
                 writer.writerow(('time_A','pulse_height_A',
                                  'time_B','pulse_height_B'))
+
+    def _maybe_write_run_settings(self):
+        """Create runNNNNN/settings.txt with raw ns and human-readable time."""
+        try:
+            if not getattr(self, "_run_dir", None):
+                return
+            if getattr(self, "_settings_written", False):
+                return
+            ns = int(self._run_epoch_wall_ns)
+            human = datetime.fromtimestamp(ns / 1e9).isoformat(sep=" ", timespec="microseconds")
+            path = Path(self._run_dir) / "settings.txt"
+            # Write only if it doesn't exist (keeps the first epoch recorded)
+            if not path.exists():
+                path.write_text(f"{ns}\n{human}\n", encoding="utf-8")
+            self._settings_written = True
+        except Exception:
+            # Non-fatal: don't interrupt acquisition if disk write fails
+            pass
 
     def stop_run(self):
         self._is_running = False
@@ -811,12 +884,17 @@ class UserInterface(QtWidgets.QMainWindow):
                   .format(self._output_filename))
             return 0
 
-    def write_info_file(self):
-        info_filename = self._output_filename.with_suffix('.info')
+    def write_info_file(self, info_filename: Path | None = None):
+        if info_filename is None:
+            # Original behavior (CSV companion .info)
+            info_filename = self._output_filename.with_suffix('.info')
+
         try:
             info_file = open(info_filename, 'w', newline='', encoding="utf-8")
         except IOError:
             print(f'Error: Unable to open: {info_filename}\n')
+            return
+
         info_file.write(f'Start time: {time.ctime(self._t_start_run)}\n')
         info_file.write(f'Run time: {self._run_time:.1f} s\n')
         info_file.write(f'Coupling: {self._coupling}\n')
