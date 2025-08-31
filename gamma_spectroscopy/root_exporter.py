@@ -47,7 +47,8 @@ class RootWriter:
             flags_u32: int = 0, probe_i32: int | None = None, board_u16: int = 0):
         if probe_i32 is None: probe_i32 = self.ch_idx
         self._buf["Channel"].append(np.uint16(self.ch_idx))
-        self._buf["Timestamp"].append(np.uint64(ts_ns))
+        ts_ps = int(ts_ns) * 1000
+        self._buf["Timestamp"].append(np.uint64(ts_ps))
         self._buf["Board"].append(np.uint16(board_u16))
         self._buf["Energy"].append(np.uint16(energy_u16))
         self._buf["Flags"].append(np.uint32(flags_u32))
