@@ -66,6 +66,9 @@ class _SettingsStore:
         set_spin(ui.uld_box,             s.value("uld",            type=float))
         set_spin(ui.num_bins_box,        s.value("num_bins",       type=int))
         set_spin(ui.run_duration_box,    s.value("run_duration",   type=float))
+        # NEW: number of captures
+        if hasattr(ui, "num_captures_box"):
+            set_spin(ui.num_captures_box, s.value("num_captures", type=int))
 
         # Re-apply to hardware/state once (no signals fired during load)
 
@@ -92,6 +95,14 @@ class _SettingsStore:
         # 5) Finalize trigger (uses channel + flags + thresholds)
         ui.set_trigger()
 
+        # 6) View toggles (persist _show_guides and _show_marks)
+        show_guides_saved = s.value("show_guides", type=bool)
+        if show_guides_saved is not None and bool(show_guides_saved) != bool(getattr(ui, "_show_guides", False)):
+            ui.toggle_guides()
+
+        show_marks_saved = s.value("show_marks", type=bool)
+        if show_marks_saved is not None and bool(show_marks_saved) != bool(getattr(ui, "_show_marks", False)):
+            ui.toggle_show_marks_or_lines()
 
     def save(self):
         ui, s = self.ui, self.s
@@ -117,6 +128,12 @@ class _SettingsStore:
         s.setValue("uld",            float(ui.uld_box.value()))
         s.setValue("num_bins",       int(ui.num_bins_box.value()))
         s.setValue("run_duration",   float(ui.run_duration_box.value()))
+        # NEW: number of captures
+        if hasattr(ui, "num_captures_box"):
+            s.setValue("num_captures", int(ui.num_captures_box.value()))
+        # NEW: view toggles
+        s.setValue("show_guides", bool(getattr(ui, "_show_guides", False)))
+        s.setValue("show_marks",  bool(getattr(ui, "_show_marks",  False)))
 
     # --------- internal ----------
     def _closeEvent_with_save(self, evt):
