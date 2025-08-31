@@ -722,9 +722,9 @@ class UserInterface(QtWidgets.QMainWindow):
     def update_event_plot(self, x, A, B, pulseheights, baselines):
         self.event_plot.clear()
         if self.ch_A_enabled_box.isChecked():
-            self.event_plot.plot(x * 1e6, A, **self._plot_options['A'])
+            self.event_plot.plot(x * 1e6, A * self._polarity_sign, **self._plot_options['A'])
         if self.ch_B_enabled_box.isChecked():
-            self.event_plot.plot(x * 1e6, B, **self._plot_options['B'])
+            self.event_plot.plot(x * 1e6, B * self._polarity_sign, **self._plot_options['B'])
 
         if self._show_guides:
             self.draw_event_plot_guides(x, baselines, pulseheights)
