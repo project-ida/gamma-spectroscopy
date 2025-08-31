@@ -569,15 +569,37 @@ class UserInterface(QtWidgets.QMainWindow):
                     abs_trig_mono_full = abs_last_trig_mono - (last_rel - trig)
                     abs_trig_mono = abs_trig_mono_full if cond is None else abs_trig_mono_full[cond]
 
-                def emit(arr, ph, ts_peak_sec, ch_idx, trig_rel_ns):
+                # STITCH: keep timestamps continuous across blocks / settings changes
+                def _stitch_run_relative(abs_ns_arr):
+                    if abs_ns_arr is None:
+                        return None
+                    # raw run-relative w.r.t. the epoch set at Run start
+                    rr = np.asarray(abs_ns_arr, dtype=np.int64) - np.int64(self._run_epoch_mono_ns)
+                    # persistent offset & last time (created on first use)
+                    off = getattr(self, "_ts_monotonic_offset_ns", 0)
+                    last = getattr(self, "_ts_last_ns", None)
+                    # if this block's first ts would go backwards, bump offset
+                    if last is not None and rr.size and (rr[0] + off) < last:
+                        off += (last - (rr[0] + off))
+                    rr = rr + off
+                    # store back
+                    setattr(self, "_ts_monotonic_offset_ns", int(off))
+                    if rr.size:
+                        setattr(self, "_ts_last_ns", int(rr[-1]))
+                    return rr
+
+                def emit(arr, ph, ts_peak_sec, ch_idx, trig_abs_ns):
                     w = self._writers.get(ch_idx)
                     if w is None or arr.size == 0:
                         return
                     n = min(arr.shape[0], len(ph), len(ts_peak_sec))
-                    if n <= 0 or trig_rel_ns is None:
+                    if n <= 0 or trig_abs_ns is None:
+                        return
+                    run_rel_ns = _stitch_run_relative(trig_abs_ns)
+                    if run_rel_ns is None:
                         return
                     samples = np.clip(np.rint((arr[:n] / self._polarity_sign) * scale), -32768, 32767).astype(np.int16)
-                    t_ns = np.asarray(trig_rel_ns[:n], dtype=np.int64)
+                    t_ns = np.asarray(run_rel_ns[:n], dtype=np.int64)
                     t_ns = np.maximum(t_ns, 0).astype(np.uint64)
                     e_u16 = np.clip(np.rint(ph[:n]), 0, 65535).astype(np.uint16)
                     for i in range(n):
@@ -588,9 +610,8 @@ class UserInterface(QtWidgets.QMainWindow):
                         )
 
                 if abs_trig_mono is not None:
-                    run_rel_ns = np.asarray(abs_trig_mono, dtype=np.int64) - np.int64(self._run_epoch_mono_ns)
-                    emit(A, phA, tsA, 0, run_rel_ns)  # A writer may be None → harmless
-                    emit(B, phB, tsB, 1, run_rel_ns)
+                    emit(A, phA, tsA, 0, abs_trig_mono)  # A writer may be None → harmless
+                    emit(B, phB, tsB, 1, abs_trig_mono)
 
         # --- Accumulate spectrum and refresh UI
         self._baselines['A'].extend(blA)
