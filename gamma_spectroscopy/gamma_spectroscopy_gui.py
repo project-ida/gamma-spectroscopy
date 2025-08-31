@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 import time
 from datetime import datetime
+from collections import deque
 
 import numpy as np
 from pkg_resources import resource_filename
@@ -125,6 +126,10 @@ class UserInterface(QtWidgets.QMainWindow):
         self._root_folder = root_export_folder
         self._root_max_mb = root_max_mb
         self._writers = {}
+
+        # Rolling CPS over the last few seconds
+        self._rate_hist = deque()     # holds (timestamp, count_increment)
+        self._rate_window_sec = 5.0   # “current” = last 5 seconds
 
         # Absolute time epoch (ns) for this run; set when Run starts
         self._run_epoch_ns = 0
@@ -286,6 +291,19 @@ class UserInterface(QtWidgets.QMainWindow):
     def _emit_value_changed_signal(self, widget):
         widget.valueChanged.emit(widget.value())
 
+    def _current_cps(self) -> float:
+        """Return rolling counts/sec over the last self._rate_window_sec."""
+        now = time.time()
+        # Drop old samples
+        while self._rate_hist and (now - self._rate_hist[0][0] > self._rate_window_sec):
+            self._rate_hist.popleft()
+        if not self._rate_hist:
+            return 0.0
+        # Effective window is from oldest kept sample to now (≤ _rate_window_sec)
+        effective_window = max(1e-9, now - self._rate_hist[0][0])
+        total_counts = sum(n for _, n in self._rate_hist)
+        return total_counts / effective_window
+
     def _snapshot_info_throttled(self):
         """Debounce settings snapshots so sliders don't spam files."""
         if not self._is_running or not getattr(self, "_run_dir", None):
@@ -311,6 +329,8 @@ class UserInterface(QtWidgets.QMainWindow):
         if not self.is_run_time_completed():
             self._is_running = True
             self._t_start_run = time.time()
+
+            self._rate_hist.clear()
 
             # Absolute epoch for per-event timestamps (ns)
             self._run_epoch_wall_ns = time.time_ns()
@@ -502,7 +522,10 @@ class UserInterface(QtWidgets.QMainWindow):
         run_time = round(self._t_prev_run_time
                          + time.time() - self._t_start_run)
         self.run_time_label.setText(f"{run_time} s")
-        self.num_events_label.setText(f"({self.num_events} events)")
+
+        cps = self._current_cps()
+        self.num_events_label.setText(f"({self.num_events} events, ~{cps:.1f} cps)")
+
         # Force repaint for fast response on user input
         self.run_time_label.repaint()
         self.num_events_label.repaint()
@@ -544,6 +567,10 @@ class UserInterface(QtWidgets.QMainWindow):
             nA = 0 if A is None else len(A)
             nB = 0 if B is None else len(B)
             self.num_events += max(nA, nB)
+
+            now = time.time()
+            self._rate_hist.append((now, max(nA, nB)))
+
             self.plot_data_signal.emit({
                 'x': t, 'A': A, 'B': B,
                 'trig_offsets_ns': trig_offsets_ns,
@@ -567,6 +594,7 @@ class UserInterface(QtWidgets.QMainWindow):
         self._t_prev_run_time = 0
         self._t_start_run = time.time()
         self.num_events = 0
+        self._rate_hist.clear()
         self._pulseheights = {'A': [], 'B': []}
         self._baselines = {'A': [], 'B': []}
         self._update_run_time_label()
