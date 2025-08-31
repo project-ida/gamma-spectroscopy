@@ -423,66 +423,86 @@ class PicoScope5000A:
             raise PicoSDKError(f"PicoSDK returned {status_msg}")
 
     def _get_trigger_offsets_ns(self, first_segment: int, n_segments: int):
+        """
+        Return per-segment trigger offsets (ns) or None.
 
-        if n_segments <= 0:
-            return None
-
-        # map time-units enum -> scale (to nanoseconds)
-        def _units_to_ns_scale(enum_val: int) -> float:
-            return {0: 1e-6, 1: 1e-3, 2: 1.0, 3: 1e3, 4: 1e6, 5: 1e9}.get(int(enum_val), 1.0)
-
-        to_idx = int(first_segment) + int(n_segments) - 1  # inclusive
-
-        # Try the 64-bit API first
+        Workaround for a driver crash when requesting >=5 segments at once:
+        fetch in small chunks. Avoid NumPy views on ctypes memory; copy via
+        Python indexing (bounds-checked by ctypes).
+        """
         try:
-            fn = ps.ps5000aGetValuesTriggerTimeOffsetBulk64
-            # int16 handle, int64* times, int32* units, uint32 from, uint32 to
-            fn.argtypes = [
-                ctypes.c_int16,
-                ctypes.POINTER(ctypes.c_int64),
-                ctypes.POINTER(ctypes.c_int32),
-                ctypes.c_uint32,
-                ctypes.c_uint32,
-            ]
-            fn.restype = ctypes.c_int32
-
-            times = (ctypes.c_int64 * n_segments)()
-            units = ctypes.c_int32(0)
-            assert_pico_ok(fn(self._handle, times, ctypes.byref(units),
-                              ctypes.c_uint32(first_segment), ctypes.c_uint32(to_idx)))
-            scale = _units_to_ns_scale(units.value)
-            arr = np.frombuffer(times, dtype=np.int64, count=n_segments).astype(np.float64)
-            return (arr * scale).astype(np.int64)
-
-        except AttributeError:
-            # Fall back to legacy split-upper/lower API
-            try:
-                fn = ps.ps5000aGetValuesTriggerTimeOffsetBulk
-                # int16 handle, int16* upper, uint32* lower, int32* units, uint32 from, uint32 to
-                fn.argtypes = [
-                    ctypes.c_int16,
-                    ctypes.POINTER(ctypes.c_int16),
-                    ctypes.POINTER(ctypes.c_uint32),
-                    ctypes.POINTER(ctypes.c_int32),
-                    ctypes.c_uint32,
-                    ctypes.c_uint32,
-                ]
-                fn.restype = ctypes.c_int32
-
-                up = (ctypes.c_int16 * n_segments)()
-                lo = (ctypes.c_uint32 * n_segments)()
-                units = ctypes.c_int32(2)  # default ns
-                assert_pico_ok(fn(self._handle, up, lo, ctypes.byref(units),
-                                  ctypes.c_uint32(first_segment), ctypes.c_uint32(to_idx)))
-                scale = _units_to_ns_scale(units.value)
-                up64 = np.frombuffer(up, dtype=np.int16, count=n_segments).astype(np.int64)
-                lo64 = np.frombuffer(lo, dtype=np.uint32, count=n_segments).astype(np.int64)
-                arr = (up64 << 32) | lo64  # signed high + unsigned low
-                return (arr.astype(np.float64) * scale).astype(np.int64)
-            except Exception:
+            if n_segments <= 0:
                 return None
 
+            total = int(n_segments)
+            # Clamp to what we actually requested from the device
+            total = min(total, int(getattr(self, "_num_captures", total)))
+            if total <= 0:
+                return None
+
+            def _units_to_ns_scale(enum_val: int) -> float:
+                # PICO_TIME_UNITS: FS, PS, NS, US, MS, S  -> ns
+                return {0: 1e-6, 1: 1e-3, 2: 1.0, 3: 1e3, 4: 1e6, 5: 1e9}.get(int(enum_val), 1.0)
+
+            start = int(first_segment)
+            end_inclusive = start + total - 1
+            out = np.empty(total, dtype=np.int64)
+
+            CHUNK = 4  # small batches avoid SDK crash path
+            fn64 = getattr(ps, "ps5000aGetValuesTriggerTimeOffsetBulk64", None)
+
+            if fn64 is not None:
+                pos, s = 0, start
+                while s <= end_inclusive:
+                    e = min(s + CHUNK - 1, end_inclusive)
+                    n = e - s + 1
+
+                    TimesArray = ctypes.c_int64 * n
+                    times = TimesArray()
+                    units = ctypes.c_int32()
+                    assert_pico_ok(fn64(self._handle, times, ctypes.byref(units),
+                                        ctypes.c_uint32(s), ctypes.c_uint32(e)))
+                    scale = _units_to_ns_scale(units.value)
+
+                    # Copy out safely (no np.ctypeslib.as_array / frombuffer)
+                    tmp = np.array([times[i] for i in range(n)], dtype=np.float64)
+                    out[pos:pos + n] = (tmp * scale).astype(np.int64)
+
+                    pos += n
+                    s = e + 1
+                return out
+
+            # ---- Legacy split upper/lower API ----
+            fn = getattr(ps, "ps5000aGetValuesTriggerTimeOffsetBulk", None)
+            if fn is None:
+                return None
+
+            pos, s = 0, start
+            while s <= end_inclusive:
+                e = min(s + CHUNK - 1, end_inclusive)
+                n = e - s + 1
+
+                UpArray = ctypes.c_int16 * n
+                LoArray = ctypes.c_uint32 * n
+                up = UpArray()
+                lo = LoArray()
+                units = ctypes.c_int32()
+                assert_pico_ok(fn(self._handle, up, lo, ctypes.byref(units),
+                                  ctypes.c_uint32(s), ctypes.c_uint32(e)))
+                scale = _units_to_ns_scale(units.value)
+
+                up64 = np.array([up[i] for i in range(n)], dtype=np.int64)
+                lo64 = np.array([lo[i] for i in range(n)], dtype=np.int64)
+                arr = (up64 << 32) | lo64
+                out[pos:pos + n] = (arr.astype(np.float64) * scale).astype(np.int64)
+
+                pos += n
+                s = e + 1
+
+            return out
+
         except Exception:
+            # If anything goes wrong, don't crash the acquisition.
             return None
 
     def stop(self):

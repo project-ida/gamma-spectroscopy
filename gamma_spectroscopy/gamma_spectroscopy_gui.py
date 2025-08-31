@@ -505,6 +505,9 @@ class UserInterface(QtWidgets.QMainWindow):
         trig_offsets_ns = data.get('trig_offsets_ns')
         block_ready_mono_ns = data.get('block_ready_mono_ns')
 
+        # Keep an unfiltered copy of trigger offsets for the whole block
+        trig_offsets_full = None if trig_offsets_ns is None else np.asarray(trig_offsets_ns, dtype=np.int64)
+
         # Coerce to empty arrays when channel is disabled
         nsamp = self._num_samples
         A = A if (A is not None) else np.empty((0, nsamp), dtype=float)
@@ -534,6 +537,7 @@ class UserInterface(QtWidgets.QMainWindow):
                 writer.writerow((a[0], a[1], b[0], b[1]))
 
         # ULD cut (only when a specific channel is selected)
+        cond = None
         if self._is_upper_threshold_enabled and self._trigger_channel in ('A', 'B'):
             use_A = (self._trigger_channel == 'A')
             ph_sel = phA if use_A else phB
@@ -546,8 +550,7 @@ class UserInterface(QtWidgets.QMainWindow):
                 if tsA.size: tsA, blA, phA = tsA[cond], blA[cond], phA[cond]
                 if tsB.size: tsB, blB, phB = tsB[cond], blB[cond], phB[cond]
 
-                if trig_offsets_ns is not None:
-                    trig_offsets_ns = np.asarray(trig_offsets_ns)[cond]
+                # NOTE: do NOT filter trig_offsets_full here; we slice absolute times later
 
         # --- ROOT export (run-relative timestamps)
         if self._writers and (A.size or B.size):
@@ -558,12 +561,13 @@ class UserInterface(QtWidgets.QMainWindow):
 
                 # reconstruct absolute monotonic trigger times for *this* block
                 abs_trig_mono = None
-                if (trig_offsets_ns is not None) and (block_ready_mono_ns is not None):
-                    trig = np.asarray(trig_offsets_ns, dtype=np.int64)
+                if (trig_offsets_full is not None) and (block_ready_mono_ns is not None):
+                    trig = trig_offsets_full  # full, unfiltered array
                     post_ns = int(round(self._post_samples * dt_ns))
                     last_rel = int(trig[-1])
                     abs_last_trig_mono = int(block_ready_mono_ns) - post_ns
-                    abs_trig_mono = abs_last_trig_mono - (last_rel - trig)
+                    abs_trig_mono_full = abs_last_trig_mono - (last_rel - trig)
+                    abs_trig_mono = abs_trig_mono_full if cond is None else abs_trig_mono_full[cond]
 
                 def emit(arr, ph, ts_peak_sec, ch_idx, trig_rel_ns):
                     w = self._writers.get(ch_idx)
@@ -577,7 +581,11 @@ class UserInterface(QtWidgets.QMainWindow):
                     t_ns = np.maximum(t_ns, 0).astype(np.uint64)
                     e_u16 = np.clip(np.rint(ph[:n]), 0, 65535).astype(np.uint16)
                     for i in range(n):
-                        w.add(samples_i16=samples[i], ts_ns=int(t_ns[i]), energy_u16=int(e_u16[i]))
+                        w.add(
+                            samples_i16=np.ascontiguousarray(samples[i]).copy(),  # own the memory
+                            ts_ns=int(t_ns[i]),
+                            energy_u16=int(e_u16[i]),
+                        )
 
                 if abs_trig_mono is not None:
                     run_rel_ns = np.asarray(abs_trig_mono, dtype=np.int64) - np.int64(self._run_epoch_mono_ns)
