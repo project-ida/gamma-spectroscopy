@@ -703,12 +703,11 @@ class UserInterface(QtWidgets.QMainWindow):
                     t_ns = np.asarray(run_rel_ns[:n], dtype=np.int64)
                     t_ns = np.maximum(t_ns, 0).astype(np.uint64)
                     e_u16 = np.clip(np.rint(ph[:n]), 0, 65535).astype(np.uint16)
-                    for i in range(n):
-                        w.add(
-                            samples_i16=np.ascontiguousarray(samples[i]).copy(),  # own the memory
-                            ts_ns=int(t_ns[i]),
-                            energy_u16=int(e_u16[i]),
-                        )
+                    w.add_many(
+                        samples_i16=samples[:n],
+                        ts_ns=t_ns[:n],
+                        energy_u16=e_u16[:n],
+                    )
 
                 if abs_trig_mono is not None:
                     emit(A, phA, tsA, 0, abs_trig_mono)  # A writer may be None → harmless
