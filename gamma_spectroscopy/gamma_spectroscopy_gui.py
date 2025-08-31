@@ -108,6 +108,8 @@ class UserInterface(QtWidgets.QMainWindow):
         self._pulseheights = {'A': [], 'B': []}
         self._baselines = {'A': [], 'B': []}
 
+        self._buf_cfg = None  # (num_samples, num_captures)
+
         if use_fake:
             self.scope = FakePicoScope()
         else:
@@ -227,6 +229,9 @@ class UserInterface(QtWidgets.QMainWindow):
         self.toggle_markslines_button2.clicked.connect(
             self.toggle_show_marks_or_lines)
 
+        self.ch_A_enabled_box.stateChanged.connect(self.set_channel)
+        self.ch_B_enabled_box.stateChanged.connect(self.set_channel)
+
         self.run_timer.timeout.connect(self._update_run_time_label)
 
         self.init_event_plot()
@@ -290,10 +295,14 @@ class UserInterface(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def start_scope_run(self):
         num_captures = self.num_captures_box.value()
-        self.scope.set_up_buffers(self._num_samples, num_captures)
+        enA = self.ch_A_enabled_box.isChecked()
+        enB = self.ch_B_enabled_box.isChecked()
+        cfg = (self._num_samples, num_captures, enA, enB)
+        if self._buf_cfg != cfg:
+            self.scope.set_up_buffers(self._num_samples, num_captures)
+            self._buf_cfg = cfg
         self.scope.start_run(self._pre_samples, self._post_samples,
-                             self._timebase, num_captures,
-                             callback=self.callback)
+                            self._timebase, num_captures, callback=self.callback)
 
     @QtCore.pyqtSlot(int)
     def set_range(self, range_idx):
@@ -347,23 +356,26 @@ class UserInterface(QtWidgets.QMainWindow):
 
     def set_channel(self):
         self._offset = np.interp(self._offset_level, [-100, 100],
-                                 [-self._range, self._range])
+                                [-self._range, self._range])
+        enA = self.ch_A_enabled_box.isChecked()
+        enB = self.ch_B_enabled_box.isChecked()
         self.scope.set_channel('A', self._coupling, self._range,
-                               self._polarity_sign * self._offset)
+                            self._polarity_sign * self._offset, is_enabled=enA)
         self.scope.set_channel('B', self._coupling, self._range,
-                               self._polarity_sign * self._offset)
+                            self._polarity_sign * self._offset, is_enabled=enB)
         self.event_plot.setYRange(-self._range - self._offset,
-                                  self._range - self._offset)
+                                self._range - self._offset)
+        self._buf_cfg = None           # <— force re-setup next run
         self.scope.stop()
 
     def set_trigger(self):
         edge = 'RISING' if self._pulse_polarity == 'Positive' else 'FALLING'
         if self.trigger_channel_box.currentText() == 'A OR B':
             self._trigger_channel = 'A OR B'
-            self.scope.set_trigger_A_OR_B(self._polarity_sign * self._threshold,
-                                          edge,
-                                          is_enabled=self._is_trigger_enabled)
-            self._upper_trigger_state = False
+            self.scope.set_trigger_A_OR_B(self._polarity_sign * self._threshold, edge,
+                                        is_enabled=bool(self._is_trigger_enabled))
+            self._is_upper_threshold_enabled = False
+            self.upper_trigger_box.setChecked(False)
             self.upper_trigger_box.setCheckable(False)
         else:
             # get last letter of trigger channel box ('Channel A' -> 'A')
@@ -405,6 +417,8 @@ class UserInterface(QtWidgets.QMainWindow):
 
         self.scope.stop()
 
+        self._buf_cfg = None  # force re-setup on next start_scope_run
+
     def _calculate_num_samples(self):
         dt = self.scope.get_interval_from_timebase(self._timebase)
         pre_samples = floor(self._pre_trigger_window / dt)
@@ -445,19 +459,24 @@ class UserInterface(QtWidgets.QMainWindow):
 
     @QtCore.pyqtSlot()
     def fetch_data(self):
-        t, [A, B] = self.scope.get_data()
-        
-        # retrieve cached per-capture trigger offsets from the scope
+        t, ab = self.scope.get_data()
+        if ab is None:
+            return
+        A, B = ab
+
         trig_offsets_ns = self.scope.get_last_trigger_offsets_ns()
         block_ready_mono_ns = self.scope.get_last_block_ready_mono_ns()
 
-        if A is not None:
-            self.num_events += len(A)
+        if (A is not None) or (B is not None):
+            nA = 0 if A is None else len(A)
+            nB = 0 if B is None else len(B)
+            self.num_events += max(nA, nB)
             self.plot_data_signal.emit({
                 'x': t, 'A': A, 'B': B,
                 'trig_offsets_ns': trig_offsets_ns,
                 'block_ready_mono_ns': block_ready_mono_ns,
             })
+
         if self._is_running:
             if self.is_run_time_completed():
                 self.stop_run()
@@ -483,111 +502,107 @@ class UserInterface(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot(dict)
     def plot_data(self, data):
         x, A, B = data['x'], data['A'], data['B']
-        trig_offsets_ns = data.get('trig_offsets_ns', None)
-        block_ready_mono_ns = data.get('block_ready_mono_ns', None)
+        trig_offsets_ns = data.get('trig_offsets_ns')
+        block_ready_mono_ns = data.get('block_ready_mono_ns')
 
-        times, baselines, pulseheights = [], [], []
-        for data_ch in (A, B):
-            data_ch *= self._polarity_sign
-            num_samples = int(self._pre_samples * .8)
-            if self._is_baseline_correction_enabled and num_samples > 0:
-                bl = data_ch[:, :num_samples].mean(axis=1)
-            else:
-                bl = np.zeros(len(A))
-            ph = (data_ch.max(axis=1) - bl) * 1e3
-            ts = x[np.argmax(data_ch, axis=1)]
-            times.append(ts)
-            baselines.append(bl)
-            pulseheights.append(ph)
+        # Coerce to empty arrays when channel is disabled
+        nsamp = self._num_samples
+        A = A if (A is not None) else np.empty((0, nsamp), dtype=float)
+        B = B if (B is not None) else np.empty((0, nsamp), dtype=float)
 
-        times = np.array(times)
-        baselines = np.array(baselines)
-        pulseheights = np.array(pulseheights)
+        # --- Per-capture features
+        def feats(arr):
+            if arr.size == 0:
+                return np.empty(0), np.empty(0), np.empty(0)
+            arr = arr * self._polarity_sign
+            n_bl = int(self._pre_samples * 0.8)
+            bl = arr[:, :n_bl].mean(axis=1) if (self._is_baseline_correction_enabled and n_bl > 0) else np.zeros(arr.shape[0])
+            ph = (arr.max(axis=1) - bl) * 1e3
+            ts = x[np.argmax(arr, axis=1)]
+            return ts, bl, ph
 
+        tsA, blA, phA = feats(A)
+        tsB, blB, phB = feats(B)
+
+        # Optional CSV 
         if self._write_output and not self._output_file.closed:
             writer = csv.writer(self._output_file)
-            for row in zip(times[0], pulseheights[0], times[1], pulseheights[1]):
-                writer.writerow(row)
+            n = max(len(tsA), len(tsB))
+            for i in range(n):
+                a = (tsA[i], phA[i]) if i < len(tsA) else ("", "")
+                b = (tsB[i], phB[i]) if i < len(tsB) else ("", "")
+                writer.writerow((a[0], a[1], b[0], b[1]))
 
-        # --- Apply ULD cut (and keep trigger offsets in sync) ---
-        if self._is_upper_threshold_enabled and self._trigger_channel != 'A OR B':
-            channel_idx = ['A', 'B'].index(self._trigger_channel)
-            condition = (pulseheights[channel_idx, :] <= self._upper_threshold * 1e3)
-            A = A.compress(condition, axis=0)
-            B = B.compress(condition, axis=0)
-            baselines = baselines.compress(condition, axis=1)
-            pulseheights = pulseheights.compress(condition, axis=1)
-            if trig_offsets_ns is not None:
-                trig_offsets_ns = np.asarray(trig_offsets_ns)[condition]
+        # ULD cut (only when a specific channel is selected)
+        if self._is_upper_threshold_enabled and self._trigger_channel in ('A', 'B'):
+            use_A = (self._trigger_channel == 'A')
+            ph_sel = phA if use_A else phB
+            if ph_sel.size:
+                cond = (ph_sel <= self._upper_threshold * 1e3)
 
-        # --- ROOT export (uses run-relative, NTP-proof timestamps) ---
-        if self._writers:
-            tsA = x[np.argmax(A, axis=1)] if A.size else np.array([])
-            tsB = x[np.argmax(B, axis=1)] if B.size else np.array([])
+                if A.size: A = A[cond]
+                if B.size: B = B[cond]
+
+                if tsA.size: tsA, blA, phA = tsA[cond], blA[cond], phA[cond]
+                if tsB.size: tsB, blB, phB = tsB[cond], blB[cond], phB[cond]
+
+                if trig_offsets_ns is not None:
+                    trig_offsets_ns = np.asarray(trig_offsets_ns)[cond]
+
+        # --- ROOT export (run-relative timestamps)
+        if self._writers and (A.size or B.size):
             fs = self._range
             if fs:
                 scale = 32767.0 / fs
                 dt_ns = self.scope.get_interval_from_timebase(self._timebase)
-                #pre_ns = int(self._pre_samples * dt_ns)  # kept for optional peak offset math
 
-                # Reconstruct absolute (monotonic) trigger time for each capture in this block
+                # reconstruct absolute monotonic trigger times for *this* block
                 abs_trig_mono = None
                 if (trig_offsets_ns is not None) and (block_ready_mono_ns is not None):
-                    trig = np.asarray(trig_offsets_ns, dtype=np.int64)  # per-segment trigger offsets (ns)
-                    post_ns = int(self._post_samples * dt_ns)
+                    trig = np.asarray(trig_offsets_ns, dtype=np.int64)
+                    post_ns = int(round(self._post_samples * dt_ns))
                     last_rel = int(trig[-1])
-                    abs_last_trig_mono = int(block_ready_mono_ns) - post_ns  # last trigger (monotonic ns)
-                    abs_trig_mono = abs_last_trig_mono - (last_rel - trig)   # all triggers (monotonic ns)
+                    abs_last_trig_mono = int(block_ready_mono_ns) - post_ns
+                    abs_trig_mono = abs_last_trig_mono - (last_rel - trig)
 
                 def emit(arr, ph, ts_peak_sec, ch_idx, trig_rel_ns):
-                    """
-                    arr:         (n, num_samples) waveforms (V)
-                    ph:          (n,) pulse heights (mV)
-                    ts_peak_sec: (n,) peak times within capture (seconds, from x)
-                    trig_rel_ns: (n,) run-relative trigger time (monotonic ns)
-                    """
                     w = self._writers.get(ch_idx)
-                    if w is None or arr is None or arr.size == 0:
+                    if w is None or arr.size == 0:
                         return
-
-                    # store raw (un-flipped) waveform
-                    arr = arr / self._polarity_sign
                     n = min(arr.shape[0], len(ph), len(ts_peak_sec))
-                    if n <= 0:
+                    if n <= 0 or trig_rel_ns is None:
                         return
-
-                    samples = np.clip(np.rint(arr[:n] * scale), -32768, 32767).astype(np.int16)
-
-                    if trig_rel_ns is None:
-                        return  # no timing available for this block → skip writing it
-
-                    # run-relative trigger time (ns)
+                    samples = np.clip(np.rint((arr[:n] / self._polarity_sign) * scale), -32768, 32767).astype(np.int16)
                     t_ns = np.asarray(trig_rel_ns[:n], dtype=np.int64)
-
-                    # Optional: add sub-capture peak offset
-                    # dpk_ns = (np.asarray(ts_peak_sec[:n]) * 1e9 - pre_ns).astype(np.int64)
-                    # t_ns = t_ns + dpk_ns
-
                     t_ns = np.maximum(t_ns, 0).astype(np.uint64)
-
                     e_u16 = np.clip(np.rint(ph[:n]), 0, 65535).astype(np.uint16)
                     for i in range(n):
                         w.add(samples_i16=samples[i], ts_ns=int(t_ns[i]), energy_u16=int(e_u16[i]))
 
-                # Only build run-relative timestamps if we successfully reconstructed abs_trig_mono
                 if abs_trig_mono is not None:
                     run_rel_ns = np.asarray(abs_trig_mono, dtype=np.int64) - np.int64(self._run_epoch_mono_ns)
-                    emit(A, pulseheights[0], tsA, 0, run_rel_ns)
-                    emit(B, pulseheights[1], tsB, 1, run_rel_ns)
-                # else: skip ROOT writing for this block (no timing), but UI updates continue
+                    emit(A, phA, tsA, 0, run_rel_ns)  # A writer may be None → harmless
+                    emit(B, phB, tsB, 1, run_rel_ns)
 
-        # --- Accumulate spectrum and refresh UI ---
-        for channel, tvalues, blvalues, phvalues in zip(['A', 'B'], times, baselines, pulseheights):
-            self._baselines[channel].extend(blvalues)
-            self._pulseheights[channel].extend(phvalues)
+        # --- Accumulate spectrum and refresh UI
+        self._baselines['A'].extend(blA)
+        self._baselines['B'].extend(blB)
+        self._pulseheights['A'].extend(phA)
+        self._pulseheights['B'].extend(phB)
 
-        if len(A) > 0:
-            self.update_event_plot(x, A[-1], B[-1], pulseheights[:, -1], baselines[:, -1])
+        # Plot the last available capture(s)
+        if A.shape[0] or B.shape[0]:
+            lastA = A[-1] if A.shape[0] else np.zeros(nsamp)
+            lastB = B[-1] if B.shape[0] else np.zeros(nsamp)
+            ph_last = np.array([
+                phA[-1] if phA.size else 0.0,
+                phB[-1] if phB.size else 0.0,
+            ])
+            bl_last = np.array([
+                blA[-1] if blA.size else 0.0,
+                blB[-1] if blB.size else 0.0,
+            ])
+            self.update_event_plot(x, lastA, lastB, ph_last, bl_last)
             self.update_spectrum_plot()
 
 
@@ -660,13 +675,12 @@ class UserInterface(QtWidgets.QMainWindow):
         self.spectrum_plot.enableAutoRange()
 
     def update_spectrum_plot(self):
-        if len(self._baselines['A']) > 0:
+        if len(self._baselines['A']) > 0 or len(self._baselines['B']) > 0:
             self.spectrum_plot.clear()
             x, bins, channel_counts = self.make_spectrum()
             for counts, channel in zip(channel_counts, ['A', 'B']):
                 if counts is not None:
-                    self.spectrum_plot.plot(
-                        x, counts, **self._plot_options[channel])
+                    self.spectrum_plot.plot(x, counts, **self._plot_options[channel])
             if self._show_guides:
                 self.draw_spectrum_plot_guides()
 
@@ -692,10 +706,6 @@ class UserInterface(QtWidgets.QMainWindow):
         return x, bins, channel_counts
 
     def draw_spectrum_plot_guides(self):
-        min_blA = np.percentile(self._baselines['A'], 5)
-        min_blB = np.percentile(self._baselines['B'], 5)
-        # max_blA = np.percentile(self._baselines['A'], 95)
-        # max_blB = np.percentile(self._baselines['B'], 95)
         plot = self.spectrum_plot
 
         if self._is_trigger_enabled:
@@ -704,37 +714,19 @@ class UserInterface(QtWidgets.QMainWindow):
         clip_level = (self._range - self._offset)
         self.draw_guide(plot, clip_level * 1e3, 'red', 'vertical')
 
-        if self._is_upper_threshold_enabled  \
-           and not self._trigger_channel == 'A OR B':
-            self.draw_guide(plot, self._upper_threshold * 1e3, 'green',
-                            'vertical')
+        if self._is_upper_threshold_enabled and self._trigger_channel != 'A OR B':
+            self.draw_guide(plot, self._upper_threshold * 1e3, 'green', 'vertical')
 
-        if self._is_baseline_correction_enabled:
-            if self.ch_A_enabled_box.isChecked():
-                lower_bound = self._threshold - min_blA
-                self.draw_guide(plot, lower_bound * 1e3, 'purple', 'vertical')
-                # REALLY think about these ones (only look for actual clipping?)
-                # clip_level = (self._range - self._offset) - max_blA
-                # self.draw_guide(plot, clip_level * 1e3, 'purple', 'vertical')
+        if not self._is_baseline_correction_enabled:
+            return
 
-                # if (self._is_upper_threshold_enabled
-                #         and self._trigger_channel == 'A'):
-                #     upper_bound = self._upper_threshold - max_blA
-                #     self.draw_guide(plot, upper_bound * 1e3, 'purple',
-                #                     'vertical')
+        if self.ch_A_enabled_box.isChecked() and len(self._baselines['A']) > 0:
+            min_blA = np.percentile(self._baselines['A'], 5)
+            self.draw_guide(plot, (self._threshold - min_blA) * 1e3, 'purple', 'vertical')
 
-            if self.ch_B_enabled_box.isChecked():
-                lower_bound = self._threshold - min_blB
-                self.draw_guide(plot, lower_bound * 1e3, 'purple', 'vertical')
-                # REALLY think about these ones (only look for actual clipping?)
-                # clip_level = (self._range - self._offset) - max_blB
-                # self.draw_guide(plot, clip_level * 1e3, 'purple', 'vertical')
-
-                # if (self._is_upper_threshold_enabled
-                #         and self._trigger_channel == 'B'):
-                #     upper_bound = self._upper_threshold - max_blB
-                #     self.draw_guide(plot, upper_bound * 1e3, 'purple',
-                #                     'vertical')
+        if self.ch_B_enabled_box.isChecked() and len(self._baselines['B']) > 0:
+            min_blB = np.percentile(self._baselines['B'], 5)
+            self.draw_guide(plot, (self._threshold - min_blB) * 1e3, 'purple', 'vertical')
 
     def export_spectrum_dialog(self):
         """Dialog for exporting a data file."""
