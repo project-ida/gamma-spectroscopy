@@ -107,8 +107,15 @@ class UserInterface(QtWidgets.QMainWindow):
 
         super().__init__()
 
-        self._pulseheights = {'A': [], 'B': []}
-        self._baselines = {'A': [], 'B': []}
+        # Bounded for “recent window” displays (no growth over time)
+        self._pulseheights = {'A': deque(maxlen=50_000), 'B': deque(maxlen=50_000)}
+        self._baselines =    {'A': deque(maxlen=50_000), 'B': deque(maxlen=50_000)}
+
+        # Cumulative histogram storage (fixed size → constant work)
+        self._hist_edges = None
+        self._hist_centers = None
+        self._hist_A = None
+        self._hist_B = None
 
         self._buf_cfg = None  # (num_samples, num_captures)
 
@@ -227,10 +234,6 @@ class UserInterface(QtWidgets.QMainWindow):
         self.baseline_correction_box.stateChanged.connect(
             self.set_baseline_correction_state)
 
-        self.lld_box.valueChanged.connect(self.update_spectrum_plot)
-        self.uld_box.valueChanged.connect(self.update_spectrum_plot)
-        self.num_bins_box.valueChanged.connect(self.update_spectrum_plot)
-
         self.clear_run_button.clicked.connect(self.clear_run)
         self.single_button.clicked.connect(self.start_scope_run)
         self.run_stop_button.clicked.connect(self.toggle_run_stop)
@@ -278,8 +281,33 @@ class UserInterface(QtWidgets.QMainWindow):
         ]:
             _hook(w, sig)
 
+        # Rebuild the cumulative histogram whenever its definition changes
+        for w, sig in [
+            (self.lld_box, 'valueChanged'),
+            (self.uld_box, 'valueChanged'),
+            (self.num_bins_box, 'valueChanged'),
+            (self.range_box, 'currentIndexChanged'),
+            (self.offset_box, 'valueChanged'),
+            (self.polarity_box, 'currentIndexChanged'),   # ← add this
+        ]:
+            getattr(w, sig).connect(self._reset_histogram)
+
         self.init_event_plot()
         self.init_spectrum_plot()
+
+        self._ui_timer = QtCore.QTimer(self)
+        self._ui_timer.setInterval(200)  # 5 Hz
+        self._ui_timer.timeout.connect(self._ui_tick)
+        self._ui_timer.start()
+
+        # Default spectrum definition: 0–100% of full-scale, and apply style once
+        # Default spectrum definition and styling
+        self.lld_box.setValue(0)
+        self.uld_box.setValue(100)
+        self._apply_spectrum_style()
+
+        # IMPORTANT: defer the first build until after settings are restored
+        QtCore.QTimer.singleShot(0, self._reset_histogram)
 
         self._emit_value_changed_signal(self.offset_box)
         self._emit_value_changed_signal(self.threshold_box)
@@ -304,6 +332,32 @@ class UserInterface(QtWidgets.QMainWindow):
         effective_window = max(1e-9, now - self._rate_hist[0][0])
         total_counts = sum(n for _, n in self._rate_hist)
         return total_counts / effective_window
+
+    def _effective_span_mv(self) -> float:
+        # Effective headroom to the upper rail, independent of polarity.
+        # Range/offset are in volts; return span in millivolts.
+        return float(max(1.0, (self._range - self._offset) * 1e3))
+
+    def _reset_histogram(self):
+        span_mv = self._effective_span_mv()
+
+        # LLD/ULD are percentages (0..100)
+        lld_pct = float(self.lld_box.value())
+        uld_pct = float(self.uld_box.value())
+        lld_pct = min(max(lld_pct, 0.0), 100.0)
+        uld_pct = min(max(uld_pct, 0.0), 100.0)
+
+        xmin = (lld_pct * 0.01) * span_mv
+        xmax = (uld_pct * 0.01) * span_mv
+        if xmax <= xmin:
+            xmax = xmin + 1.0
+
+        nb = int(self.num_bins_box.value())
+        edges = np.linspace(xmin, xmax, nb + 1, dtype=np.float64)
+        self._hist_edges = edges
+        self._hist_centers = (edges[:-1] + edges[1:]) / 2.0
+        self._hist_A = np.zeros(nb, dtype=np.int64)
+        self._hist_B = np.zeros(nb, dtype=np.int64)
 
     def _snapshot_info_throttled(self):
         """Debounce settings snapshots so sliders don't spam files."""
@@ -466,6 +520,7 @@ class UserInterface(QtWidgets.QMainWindow):
                                 self._range - self._offset)
         self._buf_cfg = None           # <— force re-setup next run
         self.scope.stop()
+        self._reset_histogram()   # guarantees x-axis matches Range/Offset
 
     def set_trigger(self):
         edge = 'RISING' if self._pulse_polarity == 'Positive' else 'FALLING'
@@ -550,14 +605,84 @@ class UserInterface(QtWidgets.QMainWindow):
     @QtCore.pyqtSlot()
     def toggle_guides(self):
         self._show_guides = not self._show_guides
+        self._redraw_event_guides()
+
+    def _apply_spectrum_style(self):
+        """Apply current mark/line style to spectrum curves (event curves always lines)."""
+        if self._show_marks:
+            # marks for spectrum
+            self._specA.setPen(None)
+            self._specA.setSymbol(histogram_symbol)
+            self._specA.setSymbolPen('w')
+            self._specA.setSymbolSize(2)
+
+            self._specB.setPen(None)
+            self._specB.setSymbol(histogram_symbol)
+            self._specB.setSymbolPen((255, 200, 0))
+            self._specB.setSymbolSize(2)
+        else:
+            # lines for spectrum
+            self._specA.setSymbol(None)
+            self._specA.setPen(pg.mkPen('w', width=2))
+
+            self._specB.setSymbol(None)
+            self._specB.setPen(pg.mkPen((255, 200, 0), width=2))
+
+    def _clear_event_guides(self):
+        if hasattr(self, "_guide_items"):
+            for it in self._guide_items:
+                try:
+                    self.event_plot.removeItem(it)
+                except Exception:
+                    pass
+        self._guide_items = []
+
+    def _redraw_event_guides(self):
+        # called from _ui_tick; use last cached event and current settings
+        self._clear_event_guides()
+        if not self._show_guides:
+            return
+
+        ev = getattr(self, "_last_event", None)
+        if not ev or ev['x'] is None:
+            return
+
+        # Baselines and pulse heights (last capture)
+        phA, phB = ev['ph_last']
+        blA, blB = ev['bl_last']
+
+        def add_line(pos, angle, color, width=2.0):
+            item = pg.InfiniteLine(pos=pos, angle=angle,
+                                pen={'color': GUIDE_COLORS[color], 'width': width})
+            self.event_plot.addItem(item)
+            self._guide_items.append(item)
+
+        # baselines & pulse heights
+        if self.ch_A_enabled_box.isChecked():
+            add_line(blA, 0, 'blue')
+            add_line(phA / 1e3, 0, 'purple')
+        if self.ch_B_enabled_box.isChecked():
+            add_line(blB, 0, 'blue')
+            add_line(phB / 1e3, 0, 'purple')
+
+        # trigger instant (vertical)
+        x = ev['x']
+        try:
+            add_line(x[self._pre_samples] * 1e6, 90, 'green')
+        except Exception:
+            pass
+
+        # thresholds (horizontal)
+        if self._is_trigger_enabled:
+            add_line(self._threshold, 0, 'green')
+        if self._is_upper_threshold_enabled and self._trigger_channel != 'A OR B':
+            add_line(self._upper_threshold, 0, 'green')
+
 
     @QtCore.pyqtSlot()
     def toggle_show_marks_or_lines(self):
         self._show_marks = not self._show_marks
-        if self._show_marks:
-            self._plot_options = PLOT_OPTIONS['marks']
-        else:
-            self._plot_options = PLOT_OPTIONS['lines']
+        self._apply_spectrum_style()   # restyle spectrum immediately
 
     @QtCore.pyqtSlot()
     def fetch_data(self):
@@ -606,10 +731,16 @@ class UserInterface(QtWidgets.QMainWindow):
         self._t_start_run = time.time()
         self.num_events = 0
         self._rate_hist.clear()
-        self._pulseheights = {'A': [], 'B': []}
-        self._baselines = {'A': [], 'B': []}
+        # restore bounded deques
+        self._pulseheights = {'A': deque(maxlen=50_000), 'B': deque(maxlen=50_000)}
+        self._baselines    = {'A': deque(maxlen=50_000), 'B': deque(maxlen=50_000)}
+        # reset cumulative histogram and last-event cache
+        self._reset_histogram()
+        self._last_event = {'x': None, 'A': None, 'B': None,
+                            'ph_last': np.array([0.0, 0.0]),
+                            'bl_last': np.array([0.0, 0.0])}
         self._update_run_time_label()
-        self.init_spectrum_plot()
+        # (optional) don’t clear and replot here; the 5 Hz tick will refresh
 
     @QtCore.pyqtSlot(dict)
     def plot_data(self, data):
@@ -758,32 +889,48 @@ class UserInterface(QtWidgets.QMainWindow):
                     emit(A, phA, tsA, 0, abs_trig_mono)  # A writer may be None → harmless
                     emit(B, phB, tsB, 1, abs_trig_mono)
 
-        # --- Accumulate spectrum and refresh UI
-        self._baselines['A'].extend(blA)
-        self._baselines['B'].extend(blB)
-        self._pulseheights['A'].extend(phA)
-        self._pulseheights['B'].extend(phB)
+        # --- Accumulate spectrum without re-histogramming the whole run
+        # Ensure histogram exists (safe no-op if already set)
+        if self._hist_edges is None:
+            self._reset_histogram()
+
+        if phA.size:
+            idxA = np.searchsorted(self._hist_edges, phA, side='right') - 1
+            mA = (idxA >= 0) & (idxA < self._hist_A.size)
+            np.add.at(self._hist_A, idxA[mA], 1)
+            self._pulseheights['A'].extend(np.asarray(phA, dtype=float))
+        if phB.size:
+            idxB = np.searchsorted(self._hist_edges, phB, side='right') - 1
+            mB = (idxB >= 0) & (idxB < self._hist_B.size)
+            np.add.at(self._hist_B, idxB[mB], 1)
+            self._pulseheights['B'].extend(np.asarray(phB, dtype=float))
+
+        self._baselines['A'].extend(np.asarray(blA, dtype=float))
+        self._baselines['B'].extend(np.asarray(blB, dtype=float))
 
         # Plot the last available capture(s)
+        # after computing lastA/lastB/ph_last/bl_last
         if A.shape[0] or B.shape[0]:
             lastA = A[-1] if A.shape[0] else np.zeros(nsamp)
             lastB = B[-1] if B.shape[0] else np.zeros(nsamp)
-            ph_last = np.array([
-                phA[-1] if phA.size else 0.0,
-                phB[-1] if phB.size else 0.0,
-            ])
-            bl_last = np.array([
-                blA[-1] if blA.size else 0.0,
-                blB[-1] if blB.size else 0.0,
-            ])
-            self.update_event_plot(x, lastA, lastB, ph_last, bl_last)
-            self.update_spectrum_plot()
-
+            self._last_event = {
+                'x': x, 'A': lastA, 'B': lastB,
+                'ph_last': np.array([phA[-1] if phA.size else 0.0,
+                                    phB[-1] if phB.size else 0.0]),
+                'bl_last': np.array([blA[-1] if blA.size else 0.0,
+                                    blB[-1] if blB.size else 0.0]),
+            }
 
     def init_event_plot(self):
         self.event_plot.clear()
         self.event_plot.setLabels(title='Scintillator event',
-                                  bottom='Time [us]', left='Signal [V]')
+                                bottom='Time [us]', left='Signal [V]')
+        self._curveA = self.event_plot.plot([], [], **self._plot_options['A'])
+        self._curveB = self.event_plot.plot([], [], **self._plot_options['B'])
+        self._last_event = {'x': None, 'A': None, 'B': None,
+                            'ph_last': np.array([0.0, 0.0]),
+                            'bl_last': np.array([0.0, 0.0])}
+
 
     @QtCore.pyqtSlot()
     def reset_event_axes(self):
@@ -842,7 +989,9 @@ class UserInterface(QtWidgets.QMainWindow):
     def init_spectrum_plot(self):
         self.spectrum_plot.clear()
         self.spectrum_plot.setLabels(title='Spectrum',
-                                     bottom='Pulseheight [mV]', left='Counts')
+                                    bottom='Pulseheight [mV]', left='Counts')
+        self._specA = self.spectrum_plot.plot([], [], **self._plot_options['A'])
+        self._specB = self.spectrum_plot.plot([], [], **self._plot_options['B'])
 
     @QtCore.pyqtSlot()
     def reset_spectrum_axes(self):
@@ -857,6 +1006,33 @@ class UserInterface(QtWidgets.QMainWindow):
                     self.spectrum_plot.plot(x, counts, **self._plot_options[channel])
             if self._show_guides:
                 self.draw_spectrum_plot_guides()
+
+    def _ui_tick(self):
+        # Event plot (reuse curves)
+        ev = self._last_event
+        if ev['x'] is not None:
+            if self.ch_A_enabled_box.isChecked():
+                self._curveA.setData(ev['x'] * 1e6, ev['A'] * self._polarity_sign)
+            else:
+                self._curveA.setData([], [])
+            if self.ch_B_enabled_box.isChecked():
+                self._curveB.setData(ev['x'] * 1e6, ev['B'] * self._polarity_sign)
+            else:
+                self._curveB.setData([], [])
+            # optional: draw/update guides here if you want
+            self._redraw_event_guides()
+
+
+        # Spectrum plot (use cumulative histogram arrays)
+        if self._hist_centers is not None:
+            if self.ch_A_enabled_box.isChecked() and self._hist_A is not None:
+                self._specA.setData(self._hist_centers, self._hist_A)
+            else:
+                self._specA.setData([], [])
+            if self.ch_B_enabled_box.isChecked() and self._hist_B is not None:
+                self._specB.setData(self._hist_centers, self._hist_B)
+            else:
+                self._specB.setData([], [])
 
     def make_spectrum(self):
         #xrange = 2 * self._range * 1e3
@@ -885,8 +1061,13 @@ class UserInterface(QtWidgets.QMainWindow):
         if self._is_trigger_enabled:
             self.draw_guide(plot, self._threshold * 1e3, 'green', 'vertical')
 
-        clip_level = (self._range - self._offset)
-        self.draw_guide(plot, clip_level * 1e3, 'red', 'vertical')
+        # Same headroom logic as histogram (V → mV)
+        y_min = -float(self._range) - float(self._offset)
+        y_max =  float(self._range) - float(self._offset)
+        clip_v = y_max if self._polarity_sign >= 0 else -y_min
+
+        # Clip at the effective top rail, consistent with the histogram span
+        self.draw_guide(plot, self._effective_span_mv(), 'red', 'vertical')
 
         if self._is_upper_threshold_enabled and self._trigger_channel != 'A OR B':
             self.draw_guide(plot, self._upper_threshold * 1e3, 'green', 'vertical')
@@ -903,22 +1084,24 @@ class UserInterface(QtWidgets.QMainWindow):
             self.draw_guide(plot, (self._threshold - min_blB) * 1e3, 'purple', 'vertical')
 
     def export_spectrum_dialog(self):
-        """Dialog for exporting a data file."""
-
         file_path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self, caption="Save spectrum", directory="spectrum.csv")
         if not file_path:
-            # Cancel was pressed, no file was selected
             return
 
-        x, _, channel_counts = self.make_spectrum()
-        channel_counts = [u if u is not None else [0] * len(x) for
-                          u in channel_counts]
+        centers = self._hist_centers
+        if centers is None:   # nothing accumulated yet
+            centers = np.array([], dtype=float)
+            a = np.array([], dtype=int)
+            b = np.array([], dtype=int)
+        else:
+            a = self._hist_A if self._hist_A is not None else np.zeros_like(centers, dtype=int)
+            b = self._hist_B if self._hist_B is not None else np.zeros_like(centers, dtype=int)
 
         with open(file_path, 'w', newline='') as f:
             writer = csv.writer(f)
-            writer.writerow(('pulseheight', 'counts_ch_A', 'counts_ch_B'))
-            for row in zip(x, *channel_counts):
+            writer.writerow(('pulseheight_mV', 'counts_ch_A', 'counts_ch_B'))
+            for row in zip(centers, a, b):
                 writer.writerow(row)
 
     def write_output_dialog(self):
