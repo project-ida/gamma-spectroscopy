@@ -133,6 +133,7 @@ class UserInterface(QtWidgets.QMainWindow):
 
         # Absolute time epoch (ns) for this run; set when Run starts
         self._run_epoch_ns = 0
+        self._prev_block_ready_mono_ns = None  
 
         if self._root_folder:
         
@@ -335,6 +336,11 @@ class UserInterface(QtWidgets.QMainWindow):
             # Absolute epoch for per-event timestamps (ns)
             self._run_epoch_wall_ns = time.time_ns()
             self._run_epoch_mono_ns = time.monotonic_ns()
+
+            # Reset per-run timestamp helpers
+            self._prev_block_ready_mono_ns = None
+            setattr(self, "_ts_monotonic_offset_ns", 0)
+            setattr(self, "_ts_last_ns", None)
 
             # Create settings.txt once per run folder
             self._maybe_write_run_settings()
@@ -563,6 +569,10 @@ class UserInterface(QtWidgets.QMainWindow):
         trig_offsets_ns = self.scope.get_last_trigger_offsets_ns()
         block_ready_mono_ns = self.scope.get_last_block_ready_mono_ns()
 
+        # --- NEW: take and advance the anchor here (prevents races with plot_data)
+        prev_block_ready_mono_ns = getattr(self, "_prev_block_ready_mono_ns", None)
+        self._prev_block_ready_mono_ns = block_ready_mono_ns
+
         if (A is not None) or (B is not None):
             nA = 0 if A is None else len(A)
             nB = 0 if B is None else len(B)
@@ -575,6 +585,7 @@ class UserInterface(QtWidgets.QMainWindow):
                 'x': t, 'A': A, 'B': B,
                 'trig_offsets_ns': trig_offsets_ns,
                 'block_ready_mono_ns': block_ready_mono_ns,
+                'prev_block_ready_mono_ns': prev_block_ready_mono_ns,  # NEW
             })
 
         if self._is_running:
@@ -605,6 +616,7 @@ class UserInterface(QtWidgets.QMainWindow):
         x, A, B = data['x'], data['A'], data['B']
         trig_offsets_ns = data.get('trig_offsets_ns')
         block_ready_mono_ns = data.get('block_ready_mono_ns')
+        prev_block_ready_mono_ns = data.get('prev_block_ready_mono_ns')
 
         # Keep an unfiltered copy of trigger offsets for the whole block
         trig_offsets_full = None if trig_offsets_ns is None else np.asarray(trig_offsets_ns, dtype=np.int64)
@@ -661,29 +673,62 @@ class UserInterface(QtWidgets.QMainWindow):
                 dt_ns = self.scope.get_interval_from_timebase(self._timebase)
 
                 # reconstruct absolute monotonic trigger times for *this* block
+                # Rapid-block trigger offsets are segment-local; use host time to spread.
                 abs_trig_mono = None
-                if (trig_offsets_full is not None) and (block_ready_mono_ns is not None):
-                    trig = trig_offsets_full  # full, unfiltered array
+                if block_ready_mono_ns is not None:
+                    dt_ns = self.scope.get_interval_from_timebase(self._timebase)
                     post_ns = int(round(self._post_samples * dt_ns))
-                    last_rel = int(trig[-1])
-                    abs_last_trig_mono = int(block_ready_mono_ns) - post_ns
-                    abs_trig_mono_full = abs_last_trig_mono - (last_rel - trig)
-                    abs_trig_mono = abs_trig_mono_full if cond is None else abs_trig_mono_full[cond]
+                    t_last = int(block_ready_mono_ns) - post_ns  # trigger time of LAST segment in this block
+
+                    # how many captures are we actually emitting from this block (after ULD cut)?
+                    ncap_full = max(A.shape[0], B.shape[0])
+
+                    if ncap_full:
+                        if self.num_captures_box.value() > 1:
+                            # Spread captures between previous block's last trigger and this block's last trigger
+                            prev_ready = prev_block_ready_mono_ns
+                            # replace the old linspace(...) in plot_data() where we build times_full
+                            if prev_ready is None:
+                                # First block of the run: no anchor → just pack them just before t_last
+                                # (keeps order and uniqueness)
+                                times_full = np.arange(t_last - (ncap_full - 1), t_last + 1, dtype=np.int64)
+                            else:
+                                start = int(prev_ready) - post_ns      # = t_prev_last
+                                end   = t_last
+                                if end <= start:
+                                    # extremely rare: jitter or zero gap → create a 1-ns strictly increasing ladder
+                                    start = end - ncap_full
+                                # half-open spacing: (start, end]
+                                times_full = np.linspace(start, end, ncap_full + 1, dtype=np.int64)[1:]
+                        else:
+                            # Single capture per block → true time for that single capture
+                            times_full = np.full(ncap_full, t_last, dtype=np.int64)
+
+                        # Apply selection mask (ULD cut) if present
+                        abs_trig_mono = times_full if cond is None else times_full[cond]
+
+                    # remember for the next block
+                    #self._prev_block_ready_mono_ns = int(block_ready_mono_ns)
 
                 # STITCH: keep timestamps continuous across blocks / settings changes
                 def _stitch_run_relative(abs_ns_arr):
                     if abs_ns_arr is None:
                         return None
-                    # raw run-relative w.r.t. the epoch set at Run start
                     rr = np.asarray(abs_ns_arr, dtype=np.int64) - np.int64(self._run_epoch_mono_ns)
-                    # persistent offset & last time (created on first use)
-                    off = getattr(self, "_ts_monotonic_offset_ns", 0)
+
+                    off  = getattr(self, "_ts_monotonic_offset_ns", 0)
                     last = getattr(self, "_ts_last_ns", None)
-                    # if this block's first ts would go backwards, bump offset
+
                     if last is not None and rr.size and (rr[0] + off) < last:
                         off += (last - (rr[0] + off))
+
                     rr = rr + off
-                    # store back
+
+                    # NEW: enforce strictly increasing inside this batch
+                    for i in range(1, rr.size):
+                        if rr[i] <= rr[i - 1]:
+                            rr[i] = rr[i - 1] + 1  # bump by 1 ns
+
                     setattr(self, "_ts_monotonic_offset_ns", int(off))
                     if rr.size:
                         setattr(self, "_ts_last_ns", int(rr[-1]))
